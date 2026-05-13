@@ -628,6 +628,282 @@ class ArRecommenderFast:
         return self.recs_df.copy()
     
 
+class ArRecommenderFast:
+    def __init__(
+        self,
+        top_n=20,
+        min_count=1,
+        min_support=0.0,
+        exclude_same_course=False,
+        different_course_mode=None,  # None | all_per_course | one_per_course
+        score_mode="count",          # count | support | confidence | cosine | lift | custom_index
+        top_popular_A=None,
+        top_popular_B=None,
+    ):
+        self.top_n = top_n
+        self.min_count = min_count
+        self.min_support = min_support
+        self.exclude_same_course = exclude_same_course
+        self.different_course_mode = different_course_mode
+        self.score_mode = score_mode
+        self.top_popular_A = top_popular_A
+        self.top_popular_B = top_popular_B
+
+        valid_modes = {None, "all_per_course", "one_per_course"}
+        if self.different_course_mode not in valid_modes:
+            raise ValueError(
+                "different_course_mode должен быть одним из: "
+                "None, 'all_per_course', 'one_per_course'"
+            )
+
+        self.recs_df = None
+        self.course_map_ = None
+        self.lesson_counts_ = None
+        self.lesson_index_ = None
+        self.popular_lessons_ = None
+        self.top_A_set_ = None
+        self.top_B_set_ = None
+
+    def fit(self, data: pd.DataFrame):
+        req_cols = {"order_id", "lesson_id", "course_id"}
+        miss = req_cols - set(data.columns)
+        if miss:
+            raise KeyError(f"В датасете нет столбцов: {miss}")
+
+        base = data[["order_id", "lesson_id", "course_id"]].drop_duplicates()
+
+        lesson_course = (
+            base[["lesson_id", "course_id"]]
+            .drop_duplicates("lesson_id")
+            .set_index("lesson_id")["course_id"]
+        )
+        self.course_map_ = lesson_course
+
+        order_codes, order_uniques = pd.factorize(base["order_id"], sort=False)
+        lesson_codes, lesson_uniques = pd.factorize(base["lesson_id"], sort=False)
+
+        self.lesson_index_ = pd.Index(lesson_uniques)
+
+        X = csr_matrix(
+            (
+                np.ones(len(base), dtype=np.uint8),
+                (order_codes, lesson_codes)
+            ),
+            shape=(len(order_uniques), len(lesson_uniques)),
+            dtype=np.uint32
+        )
+
+        n_orders = X.shape[0]
+
+        lesson_counts = np.asarray(X.sum(axis=0)).ravel().astype(np.float32)
+        self.lesson_counts_ = pd.Series(lesson_counts, index=lesson_uniques)
+
+        self.popular_lessons_ = (
+            pd.Series(lesson_counts, index=lesson_uniques)
+            .sort_values(ascending=False)
+            .index
+            .tolist()
+        )
+
+        if self.top_popular_A is not None:
+            self.top_A_set_ = set(self.popular_lessons_[:self.top_popular_A])
+        else:
+            self.top_A_set_ = None
+
+        if self.top_popular_B is not None:
+            self.top_B_set_ = set(self.popular_lessons_[:self.top_popular_B])
+        else:
+            self.top_B_set_ = None
+
+        co = (X.T @ X).tocsr()
+        co.setdiag(0)
+        co.eliminate_zeros()
+
+        course_arr = lesson_course.reindex(lesson_uniques).to_numpy()
+
+        rows_A = []
+        rows_B = []
+        courses_A = []
+        courses_B = []
+        scores = []
+        pair_counts = []
+        ranks = []
+
+        indptr = co.indptr
+        indices = co.indices
+        data_vals = co.data.astype(np.float32)
+
+        for i in range(co.shape[0]):
+            lesson_A = lesson_uniques[i]
+            course_A = course_arr[i]
+
+            if self.top_A_set_ is not None and lesson_A not in self.top_A_set_:
+                continue
+
+            start, end = indptr[i], indptr[i + 1]
+            if start == end:
+                continue
+
+            idx = indices[start:end]
+            cnt = data_vals[start:end]
+
+            mask = np.ones(len(idx), dtype=bool)
+
+            if self.min_count > 1:
+                mask &= cnt >= self.min_count
+
+            # Если включен один из режимов "по другим курсам",
+            # same-course рекомендации всегда исключаются.
+            if self.exclude_same_course or self.different_course_mode is not None:
+                mask &= course_arr[idx] != course_arr[i]
+
+            if self.min_support > 0:
+                support_vals = cnt / n_orders
+                mask &= support_vals >= self.min_support
+
+            if self.top_B_set_ is not None:
+                lesson_B_vals = lesson_uniques[idx]
+                mask &= np.isin(lesson_B_vals, list(self.top_B_set_))
+
+            if not mask.any():
+                continue
+
+            idx = idx[mask]
+            cnt = cnt[mask]
+
+            if len(cnt) == 0:
+                continue
+
+            if self.score_mode == "count":
+                score = cnt
+
+            elif self.score_mode == "support":
+                score = cnt / n_orders
+
+            elif self.score_mode == "confidence":
+                denom = lesson_counts[i]
+                score = cnt / denom if denom > 0 else np.zeros_like(cnt)
+
+            elif self.score_mode == "cosine":
+                score = cnt / np.sqrt(lesson_counts[i] * lesson_counts[idx])
+
+            elif self.score_mode == "lift":
+                score = cnt * n_orders / (lesson_counts[i] * lesson_counts[idx])
+
+            elif self.score_mode == "custom_index":
+                row_min = cnt.min()
+                score = (cnt - row_min) / cnt
+
+            else:
+                raise ValueError(
+                    "score_mode должен быть одним из: "
+                    "count, support, confidence, cosine, lift, custom_index"
+                )
+
+            if len(score) == 0:
+                continue
+
+            course_B_vals = course_arr[idx]
+
+            def order_local(local_positions):
+                local_positions = np.asarray(local_positions)
+
+                return local_positions[
+                    np.lexsort(
+                        (
+                            -lesson_counts[idx[local_positions]],  # 3-й критерий: общая популярность lesson_B
+                            -cnt[local_positions],                 # 2-й критерий: pair_count
+                            -score[local_positions],               # 1-й критерий: score
+                        )
+                    )
+                ]
+
+            # Старое поведение:
+            # top_n лучших lesson_B глобально для lesson_A.
+            if self.different_course_mode is None:
+                k = min(self.top_n, len(score))
+
+                if k == 0:
+                    continue
+
+                if len(score) > k:
+                    top_local = np.argpartition(-score, k - 1)[:k]
+                else:
+                    top_local = np.arange(len(score))
+
+                top_local = order_local(top_local)
+
+            # Вариант 1:
+            # top_n уроков из каждого другого курса.
+            elif self.different_course_mode == "all_per_course":
+                selected = []
+
+                for course_B in pd.unique(course_B_vals):
+                    local = np.flatnonzero(course_B_vals == course_B)
+                    k = min(self.top_n, len(local))
+
+                    if k == 0:
+                        continue
+
+                    if len(local) > k:
+                        local_top = local[np.argpartition(-score[local], k - 1)[:k]]
+                    else:
+                        local_top = local
+
+                    selected.extend(order_local(local_top).tolist())
+
+                if not selected:
+                    continue
+
+                top_local = order_local(selected)
+
+            # Вариант 2:
+            # один лучший урок из каждого другого курса.
+            elif self.different_course_mode == "one_per_course":
+                selected = []
+
+                for course_B in pd.unique(course_B_vals):
+                    local = np.flatnonzero(course_B_vals == course_B)
+                    best_one = order_local(local)[:1]
+                    selected.extend(best_one.tolist())
+
+                if not selected:
+                    continue
+
+                top_local = order_local(selected)
+
+            rows_A.extend([i] * len(top_local))
+            rows_B.extend(idx[top_local].tolist())
+
+            courses_A.extend([course_A] * len(top_local))
+            courses_B.extend(course_B_vals[top_local].tolist())
+
+            scores.extend(score[top_local].tolist())
+            pair_counts.extend(cnt[top_local].tolist())
+            ranks.extend(np.arange(1, len(top_local) + 1).tolist())
+
+        self.recs_df = pd.DataFrame({
+            "lesson_A": lesson_uniques[np.array(rows_A, dtype=np.int32)],
+            "course_A": courses_A,
+            "lesson_B": lesson_uniques[np.array(rows_B, dtype=np.int32)],
+            "course_B": courses_B,
+            "score": np.array(scores, dtype=np.float32),
+            "pair_count": np.array(pair_counts, dtype=np.float32),
+            "rank": np.array(ranks, dtype=np.int16),
+        })
+
+        return self
+
+    def get_recommendations_table(self, only_score=True):
+        if self.recs_df is None:
+            raise ValueError("Сначала вызови fit()")
+
+        if only_score:
+            return self.recs_df[["lesson_A", "lesson_B", "score"]].copy()
+
+        return self.recs_df.copy()
+
+
 query = """
 WITH top_lessons AS (
     SELECT lesson_id
