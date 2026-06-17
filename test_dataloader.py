@@ -1,3 +1,10 @@
+import os
+import gc
+import time
+import psutil
+import pandas as pd
+import numpy as np
+
 class UserSequenceTestDataset(IterableDataset):
     def __init__(
         self,
@@ -257,3 +264,159 @@ metrics_rnn_recs = calc_metrics(
 )
 
 metrics_rnn_recs
+
+
+
+process = psutil.Process(os.getpid())
+
+
+def gb(x):
+    return x / 1024 ** 3
+
+
+def process_memory_gb():
+    mem = process.memory_info()
+    return gb(mem.rss)
+
+
+def df_memory_gb(df: pd.DataFrame):
+    return gb(df.memory_usage(deep=True).sum())
+
+
+def log_memory(stage: str, df: pd.DataFrame | None = None):
+    msg = f"[{time.strftime('%H:%M:%S')}] {stage} | process_rss={process_memory_gb():.2f} GB"
+
+    if df is not None:
+        msg += f" | df_memory={df_memory_gb(df):.2f} GB | rows={len(df):,}"
+
+    print(msg, flush=True)
+
+
+def log_top_columns_memory(df: pd.DataFrame, n: int = 10):
+    mem = df.memory_usage(deep=True).sort_values(ascending=False).head(n)
+    print("Top memory columns:")
+    print((mem / 1024 ** 2).round(2).astype(str) + " MB")
+    print()
+
+
+# текущий цикл
+
+log_memory("before export")
+
+with engine.connect().execution_options(stream_results=True, max_row_buffer=chunksize) as conn:
+    for i, chunk in enumerate(
+        pd.read_sql_query(
+            events_query,
+            conn,
+            params=params,
+            chunksize=chunksize,
+        )
+    ):
+        log_memory(f"chunk {i} fetched", chunk)
+        log_top_columns_memory(chunk)
+
+        for col in chunk.select_dtypes(include="object").columns:
+            chunk[col] = chunk[col].replace("", np.nan)
+
+        log_memory(f"chunk {i} after empty string replace", chunk)
+
+        chunk["passport_id"] = chunk["passport_id"].astype(str)
+
+        log_memory(f"chunk {i} before merge", chunk)
+
+        chunk = chunk.merge(
+            mapping_for_merge,
+            on="passport_id",
+            how="left",
+        )
+
+        log_memory(f"chunk {i} after merge", chunk)
+        log_top_columns_memory(chunk)
+
+        part_path = RAW_DATA_DIR / f"{RAW_DATA_FILE_NAME}_{i:03d}.parquet"
+
+        chunk.to_parquet(
+            part_path,
+            index=False,
+            compression="zstd",
+        )
+
+        log_memory(f"chunk {i} after to_parquet", chunk)
+
+        rows = len(chunk)
+        del chunk
+        collected = gc.collect()
+
+        log_memory(f"chunk {i} after del/gc, collected={collected}")
+
+        print(f"Saved chunk {i}: {rows:,} rows -> {part_path}", flush=True)
+
+
+# новый цикл
+
+chunksize = 100_000
+
+passport_to_canonical = (
+    mapping_for_merge
+    .drop_duplicates("passport_id")
+    .assign(passport_id=lambda x: x["passport_id"].astype(str))
+    .set_index("passport_id")["canonical_service_id"]
+    .to_dict()
+)
+
+for bucket in range(SAMPLE_BUCKETS):
+    print(f"\n=== Export bucket {bucket}/{SAMPLE_BUCKETS - 1} ===", flush=True)
+
+    params = {
+        "passport_ids": topk_passport_ids,
+        "bucket": bucket,
+        "max_rows": int(np.ceil(MAX_ROWS_SAFETY_LIMIT / SAMPLE_BUCKETS)),
+    }
+
+    with engine.connect().execution_options(
+        stream_results=True,
+        max_row_buffer=chunksize,
+    ) as conn:
+        for j, chunk in enumerate(
+            pd.read_sql_query(
+                events_query_by_bucket,
+                conn,
+                params=params,
+                chunksize=chunksize,
+            )
+        ):
+            log_memory(f"bucket={bucket}, chunk={j} fetched", chunk)
+
+            chunk["passport_id"] = chunk["passport_id"].astype(str)
+            chunk["canonical_service_id"] = chunk["passport_id"].map(passport_to_canonical)
+
+            chunk = chunk[
+                [
+                    "oid_sha1",
+                    "first_st_datetime",
+                    "passport_id",
+                    "canonical_service_id",
+                ]
+            ].copy()
+
+            log_memory(f"bucket={bucket}, chunk={j} prepared", chunk)
+
+            part_path = RAW_DATA_DIR / (
+                f"{RAW_DATA_FILE_NAME}_bucket_{bucket:04d}_part_{j:03d}.parquet"
+            )
+
+            chunk.to_parquet(
+                part_path,
+                index=False,
+                compression="zstd",
+            )
+
+            log_memory(f"bucket={bucket}, chunk={j} saved", chunk)
+
+            rows = len(chunk)
+            del chunk
+            gc.collect()
+
+            log_memory(f"bucket={bucket}, chunk={j} after del/gc")
+
+            print(f"Saved {rows:,} rows -> {part_path}", flush=True)
