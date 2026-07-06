@@ -594,3 +594,126 @@ class SASRecWithTextFeatures(nn.Module):
             return logits, h
 
         return logits
+
+
+# Emeddings
+class SASRecWithTextFeatures(nn.Module):
+    def __init__(
+        self,
+        num_items: int,
+        d_model: int,
+        max_len: int,
+        text_embedding_matrix: torch.Tensor,
+        n_heads: int = 4,
+        num_layers: int = 2,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
+        freeze_text_embeddings: bool = True,
+        pad_idx: int = 0,
+    ):
+        super().__init__()
+
+        self.num_items = num_items
+        self.d_model = d_model
+        self.max_len = max_len
+        self.pad_idx = pad_idx
+
+        self.item_emb = nn.Embedding(
+            num_embeddings=num_items,
+            embedding_dim=d_model,
+            padding_idx=pad_idx,
+        )
+
+        self.text_emb = nn.Embedding.from_pretrained(
+            embeddings=text_embedding_matrix,
+            freeze=freeze_text_embeddings,
+            padding_idx=pad_idx,
+        )
+
+        text_emb_dim = text_embedding_matrix.shape[1]
+
+        self.text_proj = nn.Linear(
+            text_emb_dim,
+            d_model,
+        )
+
+        self.pos_emb = nn.Embedding(
+            num_embeddings=max_len,
+            embedding_dim=d_model,
+        )
+
+        self.input_norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
+        )
+
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+        )
+
+        self.out_norm = nn.LayerNorm(d_model)
+
+        # Отдельная голова — проще и безопаснее для MVP.
+        self.output = nn.Linear(d_model, num_items)
+
+    def forward(self, input_ids, return_hidden: bool = False):
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        if seq_len > self.max_len:
+            raise ValueError(
+                f"seq_len={seq_len} > max_len={self.max_len}. "
+                f"Увеличь max_len в модели или обрезай sequence в Dataset."
+            )
+
+        key_padding_mask = input_ids.eq(self.pad_idx)
+
+        item_x = self.item_emb(input_ids)
+
+        text_x = self.text_emb(input_ids)
+        text_x = self.text_proj(text_x)
+
+        pos_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+        pos_x = self.pos_emb(pos_ids)
+
+        x = item_x + text_x + pos_x
+        x = self.input_norm(x)
+        x = self.dropout(x)
+
+        # Обнуляем PAD-позиции
+        x = x.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+
+        causal_mask = torch.triu(
+            torch.ones(
+                seq_len,
+                seq_len,
+                device=device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+
+        h = self.encoder(
+            x,
+            mask=causal_mask,
+            src_key_padding_mask=key_padding_mask,
+        )
+
+        h = self.out_norm(h)
+        h = h.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+
+        logits = self.output(h)
+
+        if return_hidden:
+            return logits, h
+
+        return logits
