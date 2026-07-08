@@ -798,3 +798,35 @@ typical_users_with_seq = typical_users.merge(
 )
 
 typical_users_with_seq.head(20)
+
+
+
+
+def calc_repeat_target_share(loader, pad_idx=0):
+    total = 0
+    repeat = 0
+    novel = 0
+
+    for batch in loader:
+        histories = batch["histories_raw"]
+        targets = batch["targets_raw"]
+
+        for hist, target_items in zip(histories, targets):
+            hist_set = set(map(int, hist))
+
+            for item in target_items:
+                item = int(item)
+                total += 1
+
+                if item in hist_set:
+                    repeat += 1
+                else:
+                    novel += 1
+
+    return {
+        "total_targets": total,
+        "repeat_targets": repeat,
+        "novel_targets": novel,
+        "repeat_share": repeat / max(total, 1),
+        "novel_share": novel / max(total, 1),
+    }

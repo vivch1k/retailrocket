@@ -717,3 +717,35 @@ class SASRecWithTextFeatures(nn.Module):
             return logits, h
 
         return logits
+
+
+
+# optimizer
+
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=3e-4,
+    weight_decay=1e-4,
+)
+
+warmup_epochs = 3
+main_epochs = EPOCHS - warmup_epochs
+
+scheduler1 = LinearLR(
+    optimizer,
+    start_factor=0.1,
+    end_factor=1.0,
+    total_iters=warmup_epochs,
+)
+
+scheduler2 = CosineAnnealingLR(
+    optimizer,
+    T_max=main_epochs,
+    eta_min=1e-5,
+)
+
+scheduler = SequentialLR(
+    optimizer,
+    schedulers=[scheduler1, scheduler2],
+    milestones=[warmup_epochs],
+)
